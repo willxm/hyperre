@@ -11,7 +11,7 @@ Match a text against thousands of regexps without running thousands of regexps.
 `hyperre` extracts from each pattern the literal strings that *must* appear in any
 matching text, indexes them in one Aho-Corasick automaton, scans the text once, and only
 runs the patterns whose literals were found. Results are identical to Go's `regexp` —
-typically **10–15× faster** for large rule sets.
+**13–15× faster** on a typical rule set, and thousands of times faster when every rule has a literal.
 
 Pure Go, standard library only, Go 1.18+. The name is a nod to Intel's
 [Hyperscan](https://github.com/intel/hyperscan), which solves the same problem in C.
@@ -126,19 +126,77 @@ compact and cheap for the garbage collector.
 
 ## Benchmarks
 
-Synthetic rule-like patterns (Chinese/English words, `.{0,5}`, `(?i)` alternations, char
-classes; ~5% without literals), 300-byte text, 2-core Intel Xeon @ 2.8 GHz, Go 1.24:
+Real numbers from `go run ./benchmarks`, single-threaded (GOMAXPROCS=1), on an Apple Silicon
+Mac (Linux arm64 VM, 4 vCPU, Go 1.24.7). Rules are generated rule-like patterns —
+Chinese/English words with gaps (`w1.{0,5}w2`), case-insensitive alternations
+(`(?i)(w1|w2)\s*w3`), character classes (`w1[\p{Han}a-z]{0,3}w2`). Each text is ~300
+bytes of mixed Chinese/English and 30% of them contain a hit. Every run checks hyperre's
+results against `regexp`.
 
-| patterns | naive loop | `FindAll` | speed-up | patterns run |
+"regexp loop" runs every compiled `regexp.Regexp` on the text; "combined regexp" is
+the usual one-big-`(p1)|(p2)|…` trick.
+
+### Typical rule set: 5% of the rules have no literal
+
+Rules like `\d{11}` have nothing to index and run on every text, so they set the floor.
+
+**FindAll** — all matching rules, per text:
+
+| rules | regexp loop | hyperre | speed-up | rules hyperre ran |
 |---:|---:|---:|---:|---:|
-| 100 | 448 µs | 44 µs | 10× | 6 |
-| 1,000 | 4.5 ms | 0.33 ms | 14× | 50 |
-| 10,000 | 52.7 ms | 4.1 ms | 13× | 504 |
+| 100 | 128.2 µs | 9.0 µs | **14×** | 3 (3.3%) |
+| 1k | 1.27 ms | 87.6 µs | **15×** | 45 (4.5%) |
+| 10k | 12.62 ms | 982 µs | **13×** | 525 (5.2%) |
+| 100k | 128.87 ms | 9.78 ms | **13×** | 4,957 (5.0%) |
 
-`New` takes about 20 ms per 1,000 patterns (mostly `regexp.Compile`).
+**Match** — does any rule match, per text:
+
+| rules | regexp loop | combined regexp | hyperre | vs loop | vs combined |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 109.6 µs | 226.7 µs | 8.3 µs | **13×** | 27× |
+| 1k | 1.05 ms | 3.48 ms | 72.2 µs | **15×** | 48× |
+| 10k | 10.91 ms | 52.66 ms | 839.8 µs | **13×** | 63× |
+| 100k | 107.66 ms | 2.24 s | 7.67 ms | **14×** | 292× |
+
+### Every rule has a literal
+
+Same generator with `-fallback 0` (e.g. a sensitive-word list). The scan cost stays
+almost flat while the regexp loop grows linearly:
+
+| rules | regexp loop (FindAll) | hyperre (FindAll) | speed-up | combined regexp (Match) | hyperre (Match) |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 158.1 µs | 3.5 µs | **45×** | 256.2 µs | 3.5 µs |
+| 1k | 1.28 ms | 4.7 µs | **272×** | 3.69 ms | 4.8 µs |
+| 10k | 12.91 ms | 6.0 µs | **2,149×** | 57.92 ms | 5.8 µs |
+| 100k | 131.44 ms | 18.2 µs | **7,218×** | 2.43 s | 15.9 µs |
+
+### Build and memory (5% set)
+
+| rules | `regexp.Compile` all | `hyperre.New` | heap, regexps | heap, hyperre |
+|---:|---:|---:|---:|---:|
+| 100 | 0.31 ms | 1.28 ms | 0.2 MB | 0.3 MB |
+| 1k | 3.38 ms | 5.43 ms | 1.6 MB | 1.7 MB |
+| 10k | 128 ms | 137 ms | 15.7 MB | 17.0 MB |
+| 100k | 657 ms | 740 ms | 157.7 MB | 167.8 MB |
+
+`hyperre.New` includes compiling every regexp; the index adds about 6–10% memory.
+
+**Takeaways**
+
+- hyperre's cost is one scan of the text (a few µs, nearly independent of the rule
+  count) plus the rules it cannot index. With 5% such rules it is a steady 13–15× faster
+  at every size; with none, the gap grows with the rule set, to over 7,000× at 100k rules.
+- The combined-regexp trick is slower than the plain loop and degrades badly
+  (2.2 s per text at 100k rules).
+- The single most effective optimisation is to give rules without a literal a
+  distinctive one (`订单\d{11}` instead of `\d{11}`).
+
+Reproduce on your machine:
 
 ```sh
-go test -bench . -run '^$'
+go run ./benchmarks                       # 100, 1k, 10k, 100k rules
+go run ./benchmarks -fallback 0           # every rule has a literal
+go run ./benchmarks -sizes 1000 -budget 5s
 ```
 
 ## Limitations
